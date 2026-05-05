@@ -1,0 +1,502 @@
+# “””
+
+# VFL Health Information Processing Study
+Preprocessing Pipeline
+
+# Author      : K23035986
+Institution : King’s College London
+Ethics Ref  : MRSP-24/25-53151
+OSF         : https://doi.org/10.17605/OSF.IO/4UKHW
+Python      : 3.12  |  pandas 2.x  |  numpy 1.x
+
+Pipeline steps:
+
+1. Load raw gaze CSVs (Unity/HTC Vive Pro Eye export)
+1. Load experimenter-coded knowledge responses
+1. Exclude pre-registered participants (corrupted data)
+1. Flag trials exceeding missing-data threshold (>25%)
+1. Compute dwell time per poster per trial (AOI collision)
+1. Compute revisit count per poster per trial (AOI re-entries)
+1. Compute knowledge scores (gist, eligibility, verbatim deviation)
+1. Merge gaze and knowledge data
+1. Export cleaned dataset + summary statistics
+
+## OUTPUT
+
+# data/processed/cleaned_dataset.csv   — 1,020 rows × 14 columns
+data/processed/summary_stats.csv     — means/SDs by condition
+
+“””
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+# ─────────────────────────────────────────────────────────────
+
+# 0.  CONFIGURATION
+
+# ─────────────────────────────────────────────────────────────
+
+# Adjust these paths to match your local directory structure
+
+RAW_GAZE_DIR   = Path(“data/raw/gaze”)           # One CSV per participant-trial
+KNOWLEDGE_FILE = Path(“data/raw/knowledge.csv”)  # Experimenter-coded responses
+OUTPUT_DIR     = Path(“data/processed”)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Pre-registered exclusions (corrupted data files)
+
+EXCLUDED_PARTICIPANTS = {“P032”, “P044”, “P052”, “P053”}
+
+# Pre-registered data-quality threshold:
+
+# trials with >25% missing/invalid gaze samples are excluded
+
+MISSING_THRESHOLD = 0.25
+
+# HTC Vive Pro Eye sampling rate
+
+SAMPLING_RATE_HZ = 120  # samples per second → each sample = 1/120 s
+
+# Experimental structure
+
+VFL_CONDITIONS = [
+“Control_30”,   # 30° aperture baseline
+“Aperture_6”,   # 6° aperture (mild peripheral loss)
+“Aperture_2”,   # 2° aperture (severe peripheral loss)
+“Scotoma_4”,    # 4° scotoma (mild central loss)
+“Scotoma_8”,    # 8° scotoma (severe central loss)
+]
+
+POSTER_TYPES = [“Bar”, “Pie”, “Icon”, “Eligibility”]
+
+VACCINE_SETS = [“ARV”, “BRV”, “CRV”, “DRV”, “ERV”]
+
+# Pre-registered correct verbatim values (one numerical target per vaccine set)
+
+# Replace with actual values from your stimuli
+
+VERBATIM_CORRECT_VALUES: dict[str, float] = {
+“ARV”: 68.0,
+“BRV”: 45.0,
+“CRV”: 52.0,
+“DRV”: 77.0,
+“ERV”: 61.0,
+}
+
+# Expected final dataset size
+
+N_PARTICIPANTS   = 51
+N_TRIALS         = 5
+N_POSTERS        = 4
+EXPECTED_ROWS    = N_PARTICIPANTS * N_TRIALS * N_POSTERS  # = 1,020
+
+# ─────────────────────────────────────────────────────────────
+
+# 1.  LOAD RAW GAZE DATA
+
+# ─────────────────────────────────────────────────────────────
+
+# Expected schema of each raw gaze CSV (Unity export):
+
+# 
+
+# timestamp_ms   : int   — Unity timestamp in milliseconds
+
+# participant_id : str   — e.g. “P001”
+
+# trial_num      : int   — 1–5 (one per VFL condition block)
+
+# vfl_condition  : str   — e.g. “Aperture_2”
+
+# vaccine_set    : str   — e.g. “ARV”
+
+# poster_aoi     : str   — “Bar” | “Pie” | “Icon” | “Eligibility” | “None”
+
+# gaze_valid     : bool  — True if Tobii validity filter passes
+
+REQUIRED_GAZE_COLS = {
+“timestamp_ms”, “participant_id”, “trial_num”,
+“vfl_condition”, “vaccine_set”, “poster_aoi”, “gaze_valid”,
+}
+
+def load_gaze_file(filepath: Path) -> pd.DataFrame:
+“”“Load and validate one raw gaze CSV.”””
+df = pd.read_csv(filepath, dtype={“participant_id”: str})
+missing_cols = REQUIRED_GAZE_COLS - set(df.columns)
+if missing_cols:
+raise ValueError(
+f”[SCHEMA ERROR] {filepath.name} is missing columns: {missing_cols}”
+)
+df[“gaze_valid”] = df[“gaze_valid”].astype(bool)
+return df
+
+def load_all_gaze(raw_dir: Path) -> pd.DataFrame:
+“””
+Load and concatenate all raw gaze CSVs.
+Files are expected to follow the naming convention: <participant_id>_*.csv
+Excluded participants are skipped entirely.
+“””
+frames = []
+csv_files = sorted(raw_dir.glob(”*.csv”))
+if not csv_files:
+raise FileNotFoundError(f”No CSV files found in {raw_dir}”)
+
+```
+for fp in csv_files:
+    # Extract participant ID from filename (e.g. "P001_trial1.csv" → "P001")
+    pid = fp.stem.split("_")[0].upper()
+    if pid in EXCLUDED_PARTICIPANTS:
+        print(f"  [SKIP] {fp.name} — pre-registered exclusion ({pid})")
+        continue
+    df = load_gaze_file(fp)
+    frames.append(df)
+    print(f"  [LOAD] {fp.name}  ({len(df):,} samples)")
+
+if not frames:
+    raise RuntimeError("No gaze data loaded after applying exclusions.")
+
+combined = pd.concat(frames, ignore_index=True)
+print(f"\n  Total gaze samples loaded: {len(combined):,}")
+return combined
+```
+
+# ─────────────────────────────────────────────────────────────
+
+# 2.  DATA-QUALITY CHECK
+
+# ─────────────────────────────────────────────────────────────
+
+def flag_low_quality_trials(gaze_df: pd.DataFrame) -> pd.DataFrame:
+“””
+Pre-registered criterion: a trial is excluded if >25% of its gaze
+samples are invalid (gaze_valid == False).
+
+```
+Returns the original DataFrame with two new columns:
+    missing_rate   : float — proportion of invalid samples per trial
+    trial_excluded : bool  — True if missing_rate > MISSING_THRESHOLD
+"""
+quality = (
+    gaze_df
+    .groupby(["participant_id", "trial_num"], as_index=False)
+    .agg(
+        total_samples   = ("gaze_valid", "count"),
+        invalid_samples = ("gaze_valid", lambda x: (~x).sum()),
+    )
+    .assign(missing_rate=lambda df: df["invalid_samples"] / df["total_samples"])
+)
+
+flagged = quality[quality["missing_rate"] > MISSING_THRESHOLD]
+if flagged.empty:
+    print(
+        f"  [OK] All trials pass the data-quality threshold "
+        f"(missing ≤ {MISSING_THRESHOLD:.0%})."
+    )
+else:
+    print(f"  [WARNING] {len(flagged)} trial(s) exceed the missing threshold:")
+    print(
+        flagged[["participant_id", "trial_num", "missing_rate"]]
+        .to_string(index=False)
+    )
+
+gaze_df = gaze_df.merge(
+    quality[["participant_id", "trial_num", "missing_rate"]],
+    on=["participant_id", "trial_num"],
+    how="left",
+)
+gaze_df["trial_excluded"] = gaze_df["missing_rate"] > MISSING_THRESHOLD
+return gaze_df
+```
+
+# ─────────────────────────────────────────────────────────────
+
+# 3.  COMPUTE AOI METRICS
+
+# ─────────────────────────────────────────────────────────────
+
+def compute_dwell_time(trial_df: pd.DataFrame, poster: str) -> float:
+“””
+Dwell time = cumulative duration (seconds) of valid gaze samples
+whose AOI label matches the target poster.
+
+```
+At 120 Hz each valid sample represents 1/120 s ≈ 8.33 ms.
+"""
+valid_in_aoi = trial_df[
+    (trial_df["poster_aoi"] == poster) &
+    (trial_df["gaze_valid"])
+]
+return round(len(valid_in_aoi) / SAMPLING_RATE_HZ, 4)
+```
+
+def compute_revisit_count(trial_df: pd.DataFrame, poster: str) -> int:
+“””
+Revisit count = number of discrete AOI re-entries.
+
+```
+Definition (pre-registered): a re-entry is scored each time gaze
+returns to the poster's AOI following ≥1 sample outside it.
+Implemented by detecting rising edges (0→1 transitions) in the
+binary in-AOI sequence after temporal sorting.
+"""
+in_aoi = (trial_df["poster_aoi"] == poster).to_numpy(dtype=int)
+if len(in_aoi) < 2:
+    return 0
+transitions = np.diff(in_aoi)
+return int((transitions == 1).sum())
+```
+
+def compute_aoi_metrics(gaze_df: pd.DataFrame) -> pd.DataFrame:
+“””
+Compute dwell time and revisit count for every
+participant × trial × poster combination.
+
+```
+Trials flagged as low-quality are excluded before computation.
+Data are sorted by timestamp within each trial to ensure correct
+revisit edge detection.
+"""
+gaze_clean = (
+    gaze_df[~gaze_df["trial_excluded"]]
+    .sort_values(["participant_id", "trial_num", "timestamp_ms"])
+    .copy()
+)
+
+records = []
+groupby_keys = ["participant_id", "trial_num", "vfl_condition", "vaccine_set"]
+
+for (pid, trial, vfl, vaccine), trial_df in gaze_clean.groupby(groupby_keys):
+    for poster in POSTER_TYPES:
+        records.append({
+            "participant_id": pid,
+            "trial_num":      trial,
+            "vfl_condition":  vfl,
+            "vaccine_set":    vaccine,
+            "poster_type":    poster,
+            "dwell_time_s":   compute_dwell_time(trial_df, poster),
+            "revisit_count":  compute_revisit_count(trial_df, poster),
+        })
+
+metrics_df = pd.DataFrame(records)
+print(f"  AOI metrics computed: {len(metrics_df)} poster-level rows")
+return metrics_df
+```
+
+# ─────────────────────────────────────────────────────────────
+
+# 4.  LOAD AND SCORE KNOWLEDGE RESPONSES
+
+# ─────────────────────────────────────────────────────────────
+
+# Expected schema of knowledge.csv (experimenter-coded):
+
+# 
+
+# participant_id     : str         — e.g. “P001”
+
+# trial_num          : int         — 1–5
+
+# vfl_condition      : str         — e.g. “Control_30”
+
+# vaccine_set        : str         — e.g. “ARV”
+
+# verbatim_response  : float       — participant’s numerical estimate
+
+# gist_q1–gist_q4    : int (0/1)  — correct (1) or incorrect (0)
+
+# elig_q1–elig_q4    : int (0/1)  — correct (1) or incorrect (0)
+
+# know_verbatim      : int (0/1)  — metamemory: 1=“I know”, 0=“I’m guessing”
+
+# know_gist_q1–q4    : int (0/1)  — metamemory per gist item
+
+# know_elig_q1–q4    : int (0/1)  — metamemory per eligibility item
+
+GIST_COLS       = [f”gist_q{i}” for i in range(1, 5)]
+ELIG_COLS       = [f”elig_q{i}” for i in range(1, 5)]
+KNOW_GIST_COLS  = [f”know_gist_q{i}” for i in range(1, 5)]
+KNOW_ELIG_COLS  = [f”know_elig_q{i}” for i in range(1, 5)]
+ALL_KNOW_COLS   = [“know_verbatim”] + KNOW_GIST_COLS + KNOW_ELIG_COLS
+
+def load_knowledge(filepath: Path) -> pd.DataFrame:
+“”“Load experimenter-coded knowledge CSV, dropping excluded participants.”””
+df = pd.read_csv(filepath, dtype={“participant_id”: str})
+before = len(df)
+df = df[~df[“participant_id”].isin(EXCLUDED_PARTICIPANTS)].copy()
+after = len(df)
+print(
+f”  Knowledge file loaded: {before} rows → “
+f”{after} rows after exclusions”
+)
+return df
+
+def compute_knowledge_scores(knowledge_df: pd.DataFrame) -> pd.DataFrame:
+“””
+Aggregate item-level responses into trial-level knowledge scores.
+
+```
+Derived variables
+-----------------
+gist_score        : int   [0–4]   Sum of gist_q1–gist_q4
+eligibility_score : int   [0–4]   Sum of elig_q1–elig_q4
+verbatim_abs_dev  : float         |response − correct value|
+verbatim_dir_dev  : float         response − correct value  (signed)
+knowing_rate      : float [0–1]   Mean of all 9 knowing judgements
+                                  (pre-registered as exploratory)
+"""
+df = knowledge_df.copy()
+
+df["gist_score"]        = df[GIST_COLS].sum(axis=1).astype(int)
+df["eligibility_score"] = df[ELIG_COLS].sum(axis=1).astype(int)
+
+df["verbatim_correct"]  = df["vaccine_set"].map(VERBATIM_CORRECT_VALUES)
+df["verbatim_abs_dev"]  = (
+    df["verbatim_response"] - df["verbatim_correct"]
+).abs().round(4)
+df["verbatim_dir_dev"]  = (
+    df["verbatim_response"] - df["verbatim_correct"]
+).round(4)
+
+# Knowing rate: proportion of questions for which participant said "I know"
+df["knowing_rate"] = df[ALL_KNOW_COLS].mean(axis=1).round(4)
+
+keep_cols = [
+    "participant_id", "trial_num", "vfl_condition", "vaccine_set",
+    "gist_score", "eligibility_score",
+    "verbatim_response", "verbatim_correct",
+    "verbatim_abs_dev", "verbatim_dir_dev",
+    "knowing_rate",
+]
+return df[keep_cols]
+```
+
+# ─────────────────────────────────────────────────────────────
+
+# 5.  MERGE, VALIDATE, AND EXPORT
+
+# ─────────────────────────────────────────────────────────────
+
+def merge_datasets(
+aoi_metrics: pd.DataFrame,
+knowledge_scores: pd.DataFrame,
+) -> pd.DataFrame:
+“””
+Left-join gaze metrics (poster-level) onto knowledge scores
+(trial-level). Because knowledge scores are constant across
+poster types within a trial, this correctly broadcasts trial-level
+knowledge to all four poster rows.
+“””
+merge_keys = [“participant_id”, “trial_num”, “vfl_condition”, “vaccine_set”]
+clean = aoi_metrics.merge(knowledge_scores, on=merge_keys, how=“left”)
+return clean
+
+def validate_dataset(clean_df: pd.DataFrame) -> None:
+“”“Check shape, missing values, and range constraints.”””
+actual_rows = len(clean_df)
+print(f”\n  Shape check — Expected: {EXPECTED_ROWS} rows | Actual: {actual_rows} rows”)
+if actual_rows != EXPECTED_ROWS:
+print(
+f”  [WARNING] Row count mismatch. “
+f”Check for missing or duplicated trials.”
+)
+
+```
+n_missing = clean_df.isnull().sum()
+if n_missing.any():
+    print("\n  [WARNING] Missing values detected:")
+    print(n_missing[n_missing > 0])
+else:
+    print("  [OK] No missing values in cleaned dataset.")
+
+# Range checks
+assert clean_df["gist_score"].between(0, 4).all(), \
+    "gist_score out of range [0–4]"
+assert clean_df["eligibility_score"].between(0, 4).all(), \
+    "eligibility_score out of range [0–4]"
+assert clean_df["dwell_time_s"].ge(0).all(), \
+    "Negative dwell time detected"
+assert clean_df["revisit_count"].ge(0).all(), \
+    "Negative revisit count detected"
+assert clean_df["knowing_rate"].between(0, 1).all(), \
+    "knowing_rate out of range [0–1]"
+print("  [OK] All range checks passed.")
+```
+
+def export_outputs(clean_df: pd.DataFrame) -> None:
+“”“Export cleaned dataset and summary statistics.”””
+# Full dataset
+dataset_path = OUTPUT_DIR / “cleaned_dataset.csv”
+clean_df.to_csv(dataset_path, index=False)
+print(f”\n  [SAVED] {dataset_path}”)
+
+```
+# Summary statistics by VFL condition (replicates Table 1 in dissertation)
+summary_cols = [
+    "dwell_time_s", "revisit_count",
+    "verbatim_abs_dev", "gist_score", "eligibility_score",
+]
+# Aggregate at trial level (not poster level) for knowledge outcomes
+trial_level = (
+    clean_df
+    .groupby(["participant_id", "trial_num", "vfl_condition"])[summary_cols]
+    .mean()
+    .reset_index()
+)
+summary = (
+    trial_level
+    .groupby("vfl_condition")[summary_cols]
+    .agg(["mean", "std"])
+    .round(2)
+)
+summary.columns = ["_".join(c) for c in summary.columns]
+
+summary_path = OUTPUT_DIR / "summary_stats.csv"
+summary.to_csv(summary_path)
+print(f"  [SAVED] {summary_path}")
+
+# Print to console (mirrors dissertation Table 1)
+print("\n── Summary Statistics by VFL Condition ─────────────────────")
+print(summary.to_string())
+```
+
+# ─────────────────────────────────────────────────────────────
+
+# 6.  MAIN
+
+# ─────────────────────────────────────────────────────────────
+
+def main() -> None:
+sep = “=” * 60
+print(sep)
+print(”  VFL Study — Data Preprocessing Pipeline”)
+print(sep)
+
+```
+print("\n[Step 1/5]  Loading raw gaze data...")
+gaze_raw = load_all_gaze(RAW_GAZE_DIR)
+
+print("\n[Step 2/5]  Checking data quality...")
+gaze_raw = flag_low_quality_trials(gaze_raw)
+
+print("\n[Step 3/5]  Computing AOI metrics (dwell time, revisit count)...")
+aoi_metrics = compute_aoi_metrics(gaze_raw)
+
+print("\n[Step 4/5]  Processing knowledge responses...")
+knowledge_raw    = load_knowledge(KNOWLEDGE_FILE)
+knowledge_scores = compute_knowledge_scores(knowledge_raw)
+
+print("\n[Step 5/5]  Merging, validating, and exporting...")
+clean_df = merge_datasets(aoi_metrics, knowledge_scores)
+validate_dataset(clean_df)
+export_outputs(clean_df)
+
+print(f"\n{'=' * 60}")
+print("  Preprocessing complete.")
+print(f"  Output: {OUTPUT_DIR.resolve()}")
+print(f"{'=' * 60}\n")
+```
+
+if **name** == “**main**”:
+main()
