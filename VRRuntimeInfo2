@@ -1,0 +1,59 @@
+using UnityEngine;
+using UnityEngine.XR;
+
+public class VRRuntimeInfo2 : MonoBehaviour
+{
+    public int logEveryNFrames = 300; // ~5 seconds at 60 Hz
+
+    private Camera cam;
+    private int frameCount;
+
+    void Awake()
+    {
+        cam = GetComponent<Camera>();
+        if (cam == null)
+            cam = Camera.main;
+    }
+
+    void Update()
+    {
+        frameCount++;
+        if (frameCount % logEveryNFrames == 0)
+        {
+            LogXRInfo();
+        }
+    }
+
+    void LogXRInfo()
+    {
+        int w = XRSettings.eyeTextureWidth;
+        int h = XRSettings.eyeTextureHeight;
+
+        string device = XRSettings.loadedDeviceName;
+        float scale = XRSettings.eyeTextureResolutionScale;
+
+        if (cam != null && cam.stereoEnabled)
+        {
+            var left = cam.GetStereoProjectionMatrix(Camera.StereoscopicEye.Left);
+            var right = cam.GetStereoProjectionMatrix(Camera.StereoscopicEye.Right);
+
+            float fovV_L = Mathf.Rad2Deg * (2f * Mathf.Atan(1f / left[1, 1]));
+            float fovH_L = Mathf.Rad2Deg * (2f * Mathf.Atan(1f / left[0, 0]));
+
+            float fovV_R = Mathf.Rad2Deg * (2f * Mathf.Atan(1f / right[1, 1]));
+            float fovH_R = Mathf.Rad2Deg * (2f * Mathf.Atan(1f / right[0, 0]));
+
+            Debug.Log(
+                $"[VRRuntimeInfo] Device='{device}', eyeTex={w}x{h}, scale={scale:F2} | " +
+                $"Left FOV HxV={fovH_L:F2}�{fovV_L:F2} deg, " +
+                $"Right FOV HxV={fovH_R:F2}�{fovV_R:F2} deg"
+            );
+        }
+        else
+        {
+            Debug.Log(
+                $"[VRRuntimeInfo] Device='{device}', eyeTex={w}x{h}, scale={scale:F2} | stereo not enabled yet."
+            );
+        }
+    }
+}
