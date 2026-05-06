@@ -1,0 +1,62 @@
+using System.Collections;
+using System.IO;
+using UnityEngine;
+using UnityEngine.XR;
+
+public class URP_XREyeFrameCapture : MonoBehaviour
+{
+    public KeyCode captureKey = KeyCode.P;
+    public int warmupFrames = 60;
+    public bool useTimestamp = true;
+    public bool logXRInfo = true;
+
+    private int frameCount;
+
+    void Update()
+    {
+        frameCount++;
+        if (frameCount < warmupFrames) return;
+
+        if (Input.GetKeyDown(captureKey))
+        {
+            StartCoroutine(CaptureEndOfFrame());
+        }
+    }
+
+    IEnumerator CaptureEndOfFrame()
+    {
+        // Wait until scene + UI have fully rendered
+        yield return new WaitForEndOfFrame();
+
+        int w = Screen.width;
+        int h = Screen.height;
+
+        Texture2D tex = new Texture2D(w, h, TextureFormat.RGBA32, false);
+        tex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
+        tex.Apply();
+
+        string folder = Path.Combine(Application.persistentDataPath, "EyeCaptures");
+        Directory.CreateDirectory(folder);
+
+        string stamp = useTimestamp
+            ? System.DateTime.Now.ToString("yyyyMMdd_HHmmss_fff")
+            : "capture";
+
+        string filename = $"XRFrame_{w}x{h}_{stamp}.png";
+        string fullPath = Path.Combine(folder, filename);
+
+        File.WriteAllBytes(fullPath, tex.EncodeToPNG());
+        Destroy(tex);
+
+        Debug.Log($"[URP_XREyeFrameCapture] Saved PNG: {fullPath}");
+
+        if (logXRInfo)
+        {
+            Debug.Log(
+                $"[URP_XREyeFrameCapture] XR device='{XRSettings.loadedDeviceName}', " +
+                $"eyeTexture={XRSettings.eyeTextureWidth}x{XRSettings.eyeTextureHeight}, " +
+                $"scale={XRSettings.eyeTextureResolutionScale:F2}"
+            );
+        }
+    }
+}
